@@ -3,6 +3,8 @@ import json
 import os
 import re
 import shutil
+import subprocess
+import traceback
 
 import magic
 from tqdm import tqdm
@@ -40,67 +42,97 @@ class Metadata:
         """
         Given a root_folder it will associate all files (images and videos) to their associated metadata file.
         After it will write the EXIF metadata present in the metadata file to the image/video file writing the new file
-        to output_folder
+        to output_folder.
+
+        If a file fails, it is moved together with its metadata JSON to:
+        <root_folder>/errors/<same relative path as output_folder>
+        and an .error.log file is written next to it.
         """
         files_with_metadata = Metadata._get_files_with_metadata(root_folder)
         print(f"{len(files_with_metadata)} file(s) to recover metadata")
 
         for media_file, metadata_file in tqdm(files_with_metadata.items()):
+            original_media_file = media_file
+            original_metadata_file = metadata_file
             output_filepath = Metadata._get_output_filename(root_folder, output_folder, media_file)
-            if metadata_file is None:
-                tqdm.write(
-                    f"Skipping {media_file} as there is no metadata associated. Saving to output folder"
-                )
-                Metadata._copy_file(media_file, output_filepath)
-                continue
 
-            tqdm.write(f"Recovering {media_file}")
-            with open(metadata_file) as f:
-                metadata = json.load(f)
-
-            mime_type = magic.from_file(media_file, mime=True)
-            valid_extensions = Metadata._MIME_TYPES_MAP.get(mime_type)
-            if not valid_extensions:
-                tqdm.write(
-                    f"Mime type {mime_type} is not supported. Skipping metadata file {metadata_file}. "
-                    f"Saving image/video file to output folder"
-                )
-                Metadata._copy_file(media_file, output_filepath)
-                continue
-
-            output_dir = os.path.dirname(output_filepath)
-            if not os.path.exists(output_dir):
-                os.makedirs(output_dir)
-
-            media_file_extension = os.path.splitext(media_file)[1].lower()
-            original_output_filepath = output_filepath
-            revert_file_extension = False
-            if media_file_extension not in valid_extensions:
-                # If the file we are processing has the incorrect extension let's swap it for the correct extension
-                revert_file_extension = True
-                media_file_extension = valid_extensions[0]
-                output_filename = os.path.splitext(os.path.basename(output_filepath))[0]
-                output_filepath = os.path.join(output_dir, output_filename + media_file_extension)
-                Metadata._copy_file(media_file, output_filepath)
-                media_file = output_filepath
-                output_filepath = os.path.join(
-                    output_dir, f"{output_filename}_changed{media_file_extension}"
-                )
-
-            exif_writer = Metadata._SUPPORTED_EXTENSIONS[media_file_extension]
             try:
-                exif_writer.write(media_file, output_filepath, metadata)
-            except ExifWriterError:
-                tqdm.write("Ignoring exif write")
-                Metadata._copy_file(media_file, output_filepath)
+                if metadata_file is None:
+                    tqdm.write(
+                        f"Skipping {media_file} as there is no metadata associated. Saving to output folder"
+                    )
+                    Metadata._copy_file(media_file, output_filepath)
+                    continue
 
-            if revert_file_extension:
-                os.rename(output_filepath, original_output_filepath)
-                os.remove(media_file)
-                output_filepath = original_output_filepath
+                tqdm.write(f"Recovering {media_file}")
+                with open(metadata_file) as f:
+                    metadata = json.load(f)
 
-            creation_timestamp = int(metadata["creationTime"]["timestamp"])
-            os.utime(output_filepath, (creation_timestamp, creation_timestamp))
+                mime_type = magic.from_file(media_file, mime=True)
+                valid_extensions = Metadata._MIME_TYPES_MAP.get(mime_type)
+                if not valid_extensions:
+                    tqdm.write(
+                        f"Mime type {mime_type} is not supported. Skipping metadata file {metadata_file}. "
+                        f"Saving image/video file to output folder"
+                    )
+                    Metadata._copy_file(media_file, output_filepath)
+                    continue
+
+                output_dir = os.path.dirname(output_filepath)
+                if not os.path.exists(output_dir):
+                    os.makedirs(output_dir)
+
+                media_file_extension = os.path.splitext(media_file)[1].lower()
+                original_output_filepath = output_filepath
+                revert_file_extension = False
+                temporary_media_file = None
+
+                if media_file_extension not in valid_extensions:
+                    # If the file we are processing has the incorrect extension let's swap it for the correct extension
+                    revert_file_extension = True
+                    media_file_extension = valid_extensions[0]
+                    output_filename = os.path.splitext(os.path.basename(output_filepath))[0]
+                    output_filepath = os.path.join(output_dir, output_filename + media_file_extension)
+                    Metadata._copy_file(media_file, output_filepath)
+                    temporary_media_file = output_filepath
+                    media_file = output_filepath
+                    output_filepath = os.path.join(
+                        output_dir, f"{output_filename}_changed{media_file_extension}"
+                    )
+
+                exif_writer = Metadata._SUPPORTED_EXTENSIONS[media_file_extension]
+                try:
+                    exif_writer.write(media_file, output_filepath, metadata)
+                except ExifWriterError:
+                    tqdm.write("Ignoring exif write")
+                    Metadata._copy_file(media_file, output_filepath)
+
+                if revert_file_extension:
+                    os.rename(output_filepath, original_output_filepath)
+                    if temporary_media_file and os.path.exists(temporary_media_file):
+                        os.remove(temporary_media_file)
+                    output_filepath = original_output_filepath
+
+                creation_timestamp = int(metadata["creationTime"]["timestamp"])
+                os.utime(output_filepath, (creation_timestamp, creation_timestamp))
+
+            except Exception as e:
+                tqdm.write(f"ERROR processing {original_media_file}. Moving to errors folder and continuing.")
+                Metadata._move_to_error_folder(
+                    root_folder=root_folder,
+                    media_file=original_media_file,
+                    metadata_file=original_metadata_file,
+                    error=e,
+                )
+
+                # Remove a partially created output file, if any.
+                try:
+                    if os.path.exists(output_filepath):
+                        os.remove(output_filepath)
+                except Exception:
+                    pass
+
+                continue
 
         print("Recovery of metadata completed")
 
@@ -122,7 +154,7 @@ class Metadata:
 
         # Let's validate if we did not miss any metadata file
         for path in glob.glob(f"{root_folder}/**", recursive=True):
-            if not os.path.isfile(path):
+            if not os.path.isfile(path) or Metadata._is_inside_errors_folder(root_folder, path):
                 continue
             extension = os.path.splitext(path)[1]
             if extension == ".json" and path not in matched_metadata_files:
@@ -186,7 +218,7 @@ class Metadata:
         """Returns all non json files aka all images and videos"""
         files = []
         for path in glob.glob(f"{root_folder}/**", recursive=True):
-            if not os.path.isfile(path):
+            if not os.path.isfile(path) or Metadata._is_inside_errors_folder(root_folder, path):
                 continue
             extension = os.path.splitext(path)[1]
             if extension != ".json":
@@ -245,6 +277,74 @@ class Metadata:
         """Check if the given file is a live photo from iOS"""
         file_path = os.path.splitext(file)[0]
         return os.path.isfile(f"{file_path}.heic")
+
+    @staticmethod
+    def _move_to_error_folder(root_folder: str, media_file: str, metadata_file: str | None, error: Exception) -> None:
+        errors_root = os.path.join(root_folder, "errors")
+
+        relative_media_path = os.path.relpath(media_file, root_folder)
+        error_media_path = os.path.join(errors_root, relative_media_path)
+        error_dir = os.path.dirname(error_media_path)
+
+        if not os.path.isdir(error_dir):
+            os.makedirs(error_dir)
+
+        if os.path.exists(media_file):
+            shutil.move(media_file, os.path.normpath(error_media_path))
+
+        if metadata_file is not None and os.path.exists(metadata_file):
+            error_metadata_path = os.path.join(error_dir, os.path.basename(metadata_file))
+            shutil.move(metadata_file, os.path.normpath(error_metadata_path))
+
+        filename_without_extension = os.path.splitext(os.path.basename(media_file))[0]
+        error_log_path = os.path.join(error_dir, f"{filename_without_extension}.error.log")
+
+        with open(error_log_path, "w", encoding="utf-8") as f:
+            f.write(Metadata._format_error_log(media_file, metadata_file, error))
+
+    @staticmethod
+    def _format_error_log(media_file: str, metadata_file: str | None, error: Exception) -> str:
+        lines = [
+            f"Media file: {media_file}",
+            f"Metadata file: {metadata_file}",
+            f"Error type: {type(error).__name__}",
+            f"Error: {error}",
+            "",
+        ]
+
+        if isinstance(error, subprocess.CalledProcessError):
+            lines.extend([
+                "Command:",
+                " ".join(str(arg) for arg in error.cmd),
+                "",
+                "STDOUT:",
+                Metadata._decode_process_output(error.stdout),
+                "",
+                "STDERR:",
+                Metadata._decode_process_output(error.stderr),
+                "",
+            ])
+
+        lines.extend([
+            "Traceback:",
+            "".join(traceback.format_exception(type(error), error, error.__traceback__)),
+        ])
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _decode_process_output(value) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        return str(value)
+
+    @staticmethod
+    def _is_inside_errors_folder(root_folder: str, path: str) -> bool:
+        errors_root = os.path.abspath(os.path.join(root_folder, "errors"))
+        abs_path = os.path.abspath(path)
+        return abs_path == errors_root or abs_path.startswith(errors_root + os.sep)
 
     @staticmethod
     def _copy_file(source: str, destination: str) -> None:
