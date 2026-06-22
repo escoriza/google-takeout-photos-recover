@@ -22,14 +22,30 @@ class JPGWriter(ExifWriter):
     @staticmethod
     def _get_exif_args(source_filepath: str, output_filepath: str, metadata: dict) -> list[str]:
         timestamp = int(metadata['photoTakenTime']['timestamp'])
-        latitude = metadata['geoData']['latitude']
-        longitude = metadata['geoData']['longitude']
-        altitude = metadata['geoData']['altitude']
+        geo_data = metadata.get('geoData') or {}
+
+        latitude = geo_data.get('latitude')
+        longitude = geo_data.get('longitude')
+        altitude = geo_data.get('altitude')
+        
+        if altitude is None:
+            altitude = 0.0
+    
+        # latitude = metadata['geoData']['latitude']
+        # longitude = metadata['geoData']['longitude']
+        # altitude = metadata['geoData']['altitude']
+        
         description = metadata["description"]
         title = metadata["title"]
 
         exif_args = ['exiftool', '-q', '-P']
         exif_args.extend(JPGWriter._get_date_args(timestamp))
+        # exif_args.extend(JPGWriter._get_gps_args(latitude, longitude, altitude))
+        if (
+            latitude is not None
+            and longitude is not None
+            and not (latitude == 0.0 and longitude == 0.0)
+        ):
         exif_args.extend(JPGWriter._get_gps_args(latitude, longitude, altitude))
         exif_args.extend(JPGWriter._get_description_args(description))
         exif_args.extend(JPGWriter._get_title_args(title))
