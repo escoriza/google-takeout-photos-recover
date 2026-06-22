@@ -46,7 +46,7 @@ class JPGWriter(ExifWriter):
             and longitude is not None
             and not (latitude == 0.0 and longitude == 0.0)
         ):
-        exif_args.extend(JPGWriter._get_gps_args(latitude, longitude, altitude))
+            exif_args.extend(JPGWriter._get_gps_args(latitude, longitude, altitude))
         exif_args.extend(JPGWriter._get_description_args(description))
         exif_args.extend(JPGWriter._get_title_args(title))
         exif_args.append(source_filepath)
